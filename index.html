@@ -1611,6 +1611,11 @@ footer .net-pill.lan { color: var(--magenta); border-color: var(--magenta); }
     <div class="sect">
       <div class="sect-head"><span class="num">§ 4</span><span>SYSTEM PROMPT / TEMPLATE</span></div>
       <div class="field">
+        <label>Assistant Display Name</label>
+        <input type="text" id="cfg-assistant-name" placeholder="e.g. HERMES (default: ASSI)" maxlength="32" />
+        <div class="help">Display only — relabels assistant turns in this terminal. <strong>Never</strong> sent to the model; leave blank for the default <code>[ASSI]</code> tag.</div>
+      </div>
+      <div class="field">
         <label>System Prompt (override)</label>
         <textarea id="cfg-sysprompt" rows="6" placeholder="You are a precise, helpful AI agent…"></textarea>
       </div>
@@ -1775,6 +1780,7 @@ const DEFAULTS = {
   context: 64200,
   threshold: 70,
   systemPrompt: 'You are a precise, helpful AI agent operating inside the CHATSGI terminal. Use the MCP tools provided when they help; report your work clearly and cite tool results.',
+  assistantName: '',        // display-only label for assistant turns; never sent to the model
   detectedPrompt: '',
   thinkingEnabled: false,
   thinkCollapsed: true,
@@ -1965,7 +1971,7 @@ function handleEvent(evt) {
     state.settings = { ...DEFAULTS, ...evt.payload };
     if ($('drawer').classList.contains('open')) applyToForm();
     applySideCollapsedFromSettings();
-    updateStatus(); renderEmptyCheck();
+    updateStatus(); renderEmptyCheck(); renderMessages();
   } else if (evt.kind === 'tools-config') {
     refreshServers();
   } else if (evt.kind === 'mcp') {
@@ -2217,7 +2223,11 @@ function buildMessageEl(m, idx) {
   const meta = document.createElement('div');
   meta.className = 'msg-meta';
   const r = (m.role || 'sys').toUpperCase().slice(0, 4);
-  meta.innerHTML = `<span class="role ${m.role}">[${r}]</span><span class="idx">#${String(idx).padStart(3,'0')}</span><span class="ts">${fmtTs(m._ts)}</span>`;
+  // Assistant turns can carry a display-only label (settings.assistantName). It is
+  // purely cosmetic for this terminal and is never included in payloads to the model.
+  const aName = (state.settings.assistantName || '').trim();
+  const roleLabel = (m.role === 'assistant' && aName) ? `[${escapeHtml(aName)}]` : `[${r}]`;
+  meta.innerHTML = `<span class="role ${m.role}">${roleLabel}</span><span class="idx">#${String(idx).padStart(3,'0')}</span><span class="ts">${fmtTs(m._ts)}</span>`;
   wrap.appendChild(meta);
 
   const body = document.createElement('div');
@@ -3266,6 +3276,7 @@ async function applyToForm() {
   $('cfg-ctx').value = c.context;
   $('cfg-threshold').value = c.threshold;
   $('cfg-max-recursion').value = c.maxToolRecursion;
+  $('cfg-assistant-name').value = c.assistantName || '';
   $('cfg-sysprompt').value = c.systemPrompt;
   $('cfg-detected').value = c.detectedPrompt || '(not fetched)';
   $('cfg-thinking').checked = c.thinkingEnabled;
@@ -3303,6 +3314,7 @@ function readForm() {
   c.threshold = parseInt($('cfg-threshold').value) || DEFAULTS.threshold;
   c.maxToolRecursion = parseInt($('cfg-max-recursion').value) || 16;
   c.systemPrompt = $('cfg-sysprompt').value;
+  c.assistantName = $('cfg-assistant-name').value.trim().slice(0, 32);
   c.thinkingEnabled = $('cfg-thinking').checked;
   c.thinkCollapsed = $('cfg-think-collapsed').checked;
   c.toolsCollapsed = $('cfg-tools-collapsed').checked;
@@ -3379,7 +3391,7 @@ function attachWiring() {
 
   $('btn-save').addEventListener('click', async () => {
     const prevNet = state.settings.networkVisible;
-    readForm(); await saveConfig(); updateStatus(); renderEmptyCheck();
+    readForm(); await saveConfig(); updateStatus(); renderEmptyCheck(); renderMessages();
     if (prevNet !== state.settings.networkVisible) {
       showToast('NETWORK CHANGED', 'Restart start.py for binding change to take effect.', 'amber');
     } else {
