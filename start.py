@@ -875,6 +875,17 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address):
+        # Clients (browser polls / SSE reconnects) routinely drop the socket
+        # mid-request. On Windows this surfaces as ConnectionAbortedError
+        # (WinError 10053); elsewhere as ConnectionResetError / BrokenPipe.
+        # These are benign — swallow them and only log genuine errors.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
 CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
