@@ -1032,6 +1032,17 @@ class Handler(BaseHTTPRequestHandler):
                 result = MGR.call(name, args)
                 text = self._flatten_mcp_result(result)
                 return self._send_json(200, {"ok": True, "result": text, "raw": result})
+            if path == "/api/events/publish":
+                # Relay a client-originated event to every OTHER connected window.
+                # Used so a spoken reply mirrors across all synced terminals, not
+                # just the live window that ran the inference. `origin` is stamped
+                # so the broadcasting window ignores its own echo.
+                kind = (body or {}).get("kind")
+                payload = (body or {}).get("payload") or {}
+                if kind not in ("speak",):
+                    return self._send_json(400, {"error": "unsupported event kind"})
+                BUS.publish(kind, payload, origin=origin)
+                return self._send_json(200, {"ok": True})
             if path == "/api/tts/speak":
                 return self._tts_speak(body or {})
             if path == "/api/tts/previews/generate":
