@@ -840,7 +840,7 @@ main {
   color: var(--magenta);
   letter-spacing: 0.10em;
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   gap: 8px;
   align-items: center;
   cursor: pointer;
@@ -862,12 +862,43 @@ main {
   text-overflow: ellipsis;
   min-width: 0;
 }
+/* Folded by default: keep the call's content (args/result preview) fully
+   enclosed in the collapsed bubble — nothing leaks into the head until opened. */
+.tool-call:not(.open) .tool-call-head .preview { display: none; }
 .tool-call-head .arrow { transition: transform 0.2s; display: inline-block; }
 .tool-call.open .tool-call-head .arrow { transform: rotate(90deg); }
 .tool-call-head .id-tag {
   font-size: 9px; opacity: 0.5;
   letter-spacing: 0.04em;
   font-family: var(--mono);
+}
+/* Animated "notice" on the folded bubble — token-size readout + a pulsing
+   lamp so a collapsed tool call still gives live feedback at a glance. */
+.tool-call-head .tok-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.tool-call-head .tok-badge .pulse-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  color: var(--magenta);
+  background: currentColor;
+  animation: tcPulse 1.6s ease-in-out infinite;
+}
+.tool-call.result .tok-badge .pulse-dot { color: var(--green); }
+.tool-call.result.err .tok-badge .pulse-dot { color: var(--crit); }
+@keyframes tcPulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.75); box-shadow: 0 0 0 currentColor; }
+  50%      { opacity: 1;   transform: scale(1.15); box-shadow: 0 0 7px currentColor; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tool-call-head .tok-badge .pulse-dot { animation: none; opacity: 0.8; }
 }
 .tool-call-detail { display: none; border-top: 1px dashed var(--line); }
 .tool-call.open .tool-call-detail { display: block; }
@@ -1999,6 +2030,10 @@ function handleEvent(evt) {
       state.chats[ix].size = (evt.payload.messages || []).length;
       renderChatList();
     }
+  } else if (evt.kind === 'speak') {
+    // A reply spoken on another window — mirror it here so audio plays
+    // through every synced terminal, not just the live one.
+    RemoteSpeech.handle(evt.payload);
   }
 }
 
@@ -2259,6 +2294,7 @@ function buildMessageEl(m, idx) {
         <div class="tool-call-head" title="Toggle detail">
           <span class="lhs"><span class="arrow">▸</span><span style="color:var(--text-faint)">CALL</span><span class="name">${escapeHtml(tc.function?.name || '?')}</span></span>
           <span class="preview">${escapeHtml(preview)}</span>
+          <span class="tok-badge" title="Approx. payload size"><span class="pulse-dot"></span>${estTok(raw)} tok</span>
           <span class="id-tag">${escapeHtml((tc.id || '').slice(-6))}</span>
         </div>
         <div class="tool-call-detail">
@@ -2277,6 +2313,7 @@ function buildMessageEl(m, idx) {
       <div class="tool-call-head" title="Toggle output">
         <span class="lhs"><span class="arrow">▸</span><span style="color:var(--text-faint)">${m._error ? 'ERR ' : 'OUT '}</span><span class="name">${escapeHtml(m.name || '?')}</span></span>
         <span class="preview">${escapeHtml(preview)}</span>
+        <span class="tok-badge" title="Approx. output size"><span class="pulse-dot"></span>${estTok(m.content || '')} tok</span>
         <span class="id-tag">${escapeHtml((m.tool_call_id || '').slice(-6))}</span>
       </div>
       <div class="tool-call-detail">
@@ -2497,10 +2534,12 @@ function cleanForSpeech(s) {
 }
 
 const Speech = {
-  _raw: '', _spokenLen: 0,           // per-turn piper segmentation state
+  _raw: '', _spokenLen: 0,           // per-turn segmentation state (both engines)
   _gen: 0, _jobs: [],                // ordered prefetch/playback queue
   _playing: false, _cur: null, _warned: false, _failed: false,
   _pendingStop: false,               // root turn: cut prior speech on first new text, not on box appear
+  _bcastTurn: 0, _bcastReset: false, // mirror-to-other-windows turn id + cut signal
+  _bcastChain: Promise.resolve(),    // serialise broadcast POSTs so blocks arrive in order
 
   engine() { return state.settings.ttsEngine === 'piper' ? 'piper' : 'sfx'; },
   enabled() { return !!state.settings.soundEnabled; },
@@ -2511,17 +2550,36 @@ const Speech = {
   // round's audio playing so tool calls never chop the voice mid-sentence.
   beginTurn(root) {
     this._raw = ''; this._spokenLen = 0; this._warned = false; this._failed = false;
-    if (root) this._pendingStop = true;
+    if (root) {
+      this._pendingStop = true;
+      this._bcastTurn++;          // new mirror turn
+      this._bcastReset = true;    // first broadcast block tells other windows to cut prior audio
+    }
   },
-  endTurn() { if (this.enabled() && this.engine() === 'piper') this._pump(true); },
+  endTurn() { if (this.enabled()) this._pump(true); },
 
   feed(delta) {
     if (!delta || !this.enabled()) return;
-    if (this.engine() === 'sfx') { this._pendingStop = false; for (const ch of delta) SFX.blip(ch); return; }
+    if (this.engine() === 'sfx') { this._pendingStop = false; for (const ch of delta) SFX.blip(ch); }
     // First real text of a new root turn → only now cut the previous reply's audio.
-    if (this._pendingStop) { this._pendingStop = false; this.stop(); }
+    else if (this._pendingStop) { this._pendingStop = false; this.stop(); }
     this._raw += delta;
     this._pump(false);
+  },
+
+  // Relay one finished speech block to every OTHER synced window so the reply
+  // is heard everywhere. POSTs are chained so blocks arrive in spoken order.
+  _broadcastBlock(text, engine) {
+    const reset = this._bcastReset; this._bcastReset = false;
+    const payload = {
+      text, engine,
+      voice: state.settings.piperVoice || '',
+      rate: Number(state.settings.piperRate) || 1.0,
+      turn: this._bcastTurn, reset,
+    };
+    this._bcastChain = this._bcastChain.then(
+      () => apiPost('/api/events/publish', { kind: 'speak', payload }).catch(() => {})
+    );
   },
 
   _safeEnd(raw) {
@@ -2551,7 +2609,10 @@ const Speech = {
   },
 
   _pump(final) {
-    if (!state.settings.piperVoice) {
+    const eng = this.engine();
+    // Local Piper playback needs a selected voice; the SFX engine and the
+    // cross-window broadcast do not, so only Piper short-circuits here.
+    if (eng === 'piper' && !state.settings.piperVoice) {
       if (!this._warned && final && this._raw.trim()) {
         this._warned = true;
         showToast('NO VOICE', 'Select a Piper voice in settings → § 7 SPEECH.', 'amber');
@@ -2568,7 +2629,10 @@ const Speech = {
       if (end < 0) break;
       const block = text.slice(idx, end).replace(/\s+/g, ' ').trim();
       idx = end;
-      if (block) this._enqueue(block);
+      if (block) {
+        if (eng === 'piper') this._enqueue(block);   // play locally (Piper)
+        this._broadcastBlock(block, eng);            // mirror to other windows
+      }
     }
     this._spokenLen = idx;
   },
@@ -2644,6 +2708,85 @@ const Speech = {
     if (this.engine() !== 'piper') {
       fetch('/api/tts/unload', { method: 'POST', headers: { 'X-Origin-Id': ORIGIN_ID } }).catch(() => {});
     }
+  },
+};
+
+/* ───────────────── Remote speech (synced-window mirror) ─────────────────
+   Plays speech blocks that another window broadcast over the SSE bus, so the
+   audio response is heard through EVERY synced terminal — not only the live
+   window that ran the inference. Each block carries the originating window's
+   engine + voice so playback stays consistent across the LAN; this window's
+   own ENABLE VOICE FEEDBACK toggle and volume still gate/scale playback.
+   Ordered prefetch/playback mirrors the local Piper queue. */
+const RemoteSpeech = {
+  _gen: 0, _jobs: [], _playing: false, _cur: null,
+
+  handle(p) {
+    if (!p || !this.enabled()) return;
+    if (p.reset) this.stop();                 // a new root turn began elsewhere → cut prior audio
+    const text = (p.text || '').trim();
+    if (!text) return;
+    if (p.engine === 'sfx') { SFX.ensure(); for (const ch of text) SFX.blip(ch); SFX.blip(' '); return; }
+    if (!p.voice) return;                      // Piper block with no voice → nothing to synth
+    this._enqueue(text, p.voice, Number(p.rate) || 1.0);
+  },
+
+  enabled() { return !!state.settings.soundEnabled; },
+
+  _enqueue(text, voice, rate) {
+    const gen = this._gen;
+    const job = { url: null };
+    job.promise = this._fetch(text, voice, rate, gen).then(u => {
+      if (gen !== this._gen) { try { URL.revokeObjectURL(u); } catch {} job.url = null; }
+      else job.url = u;
+    }).catch(() => { job.url = null; });
+    this._jobs.push(job);
+    this._drain();
+  },
+
+  async _fetch(text, voice, rate, gen) {
+    rate = Math.max(0.3, Math.min(3.0, rate || 1.0));
+    const r = await fetch('/api/tts/speak', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Origin-Id': ORIGIN_ID },
+      body: JSON.stringify({ text, voice, lengthScale: 1.0 / rate }),
+    });
+    if (gen !== this._gen) throw new Error('canceled');
+    if (!r.ok) throw new Error('tts http ' + r.status);
+    return URL.createObjectURL(await r.blob());
+  },
+
+  async _drain() {
+    if (this._playing) return;
+    this._playing = true;
+    try {
+      while (this._jobs.length) {
+        const job = this._jobs[0];
+        await job.promise;
+        if (this._jobs[0] !== job) continue;   // queue was cleared by stop()
+        this._jobs.shift();
+        if (job.url) await this._play(job.url);
+      }
+    } finally { this._playing = false; }
+  },
+
+  _play(url) {
+    return new Promise(resolve => {
+      const a = new Audio(url);
+      a.volume = piperVol();
+      this._cur = a;
+      const done = () => { try { URL.revokeObjectURL(url); } catch {} if (this._cur === a) this._cur = null; resolve(); };
+      a.onended = done; a.onerror = done;
+      a.play().catch(done);
+    });
+  },
+
+  stop() {
+    this._gen++;
+    for (const j of this._jobs) if (j.url) { try { URL.revokeObjectURL(j.url); } catch {} }
+    this._jobs = [];
+    if (this._cur) { try { this._cur.pause(); } catch {} this._cur = null; }
+    this._playing = false;
   },
 };
 

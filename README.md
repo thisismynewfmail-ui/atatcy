@@ -67,7 +67,9 @@ Without it, speech falls back to the built-in villager-talk blip SFX.
 - **Cross-instance sync** — every browser/window subscribes to a Server-Sent
   Events stream. Send a message on one monitor and it appears on every other
   connected viewer immediately. Settings, chat list, active selection, and
-  MCP status all mirror.
+  MCP status all mirror. Spoken replies (SFX blips or Piper neural speech) are
+  broadcast too, so the audio response plays through every synced window — not
+  just the live one that ran the inference.
 - **Rolling context window** — when token usage crosses the threshold the
   oldest middle messages fall out of the window until usage drops below the
   cap. The first user message (original task) and the most recent turns are
@@ -130,6 +132,7 @@ Used by the UI; usable directly if you want to script it.
 | `POST /api/chats/{id}/duplicate`     | duplicate                                   |
 | `POST /api/chats/active`             | set active chat id                          |
 | `GET  /api/events`                   | Server-Sent Events bus (sync)               |
+| `POST /api/events/publish`           | relay an event (e.g. `speak`) to other windows |
 | `POST /api/llm/proxy`                | streaming proxy to the OpenAI endpoint      |
 | `GET  /api/tts/status`               | Piper availability + voice list             |
 | `GET  /api/tts/voices`               | list voices in `voices/` (+ `hasPreview`)   |
