@@ -59,6 +59,7 @@ DEFAULT_SETTINGS = {
         "terminal. Use the MCP tools provided when they help; report your "
         "work clearly and cite tool results."
     ),
+    "assistantName": "",         # display-only label for assistant turns; never sent to the model
     "detectedPrompt": "",
     "thinkingEnabled": False,
     "thinkCollapsed": True,
