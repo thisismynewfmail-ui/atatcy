@@ -1622,20 +1622,28 @@ footer .net-pill.lan { color: var(--magenta); border-color: var(--magenta); }
       <div class="sect-head"><span class="num">§ 3</span><span>CONTEXT &amp; ROLLING WINDOW</span></div>
       <div class="field-row">
         <div class="field"><label>Context Window (tokens)</label><input type="number" id="cfg-ctx" min="1024" step="1024" /></div>
-        <div class="field"><label>Roll Threshold (%)</label><input type="number" id="cfg-threshold" min="30" max="95" step="1" /></div>
-      </div>
-      <div class="field-row">
-        <div class="field"><label>Max Tool-Call Recursion</label><input type="number" id="cfg-max-recursion" min="1" max="64" step="1" /></div>
-        <div class="field" style="display:flex; align-items:end;">
-          <div class="help">Max consecutive tool rounds before the agent must finalise a text reply.</div>
+        <div class="field">
+          <label>Roll Threshold (%)</label>
+          <input type="number" id="cfg-threshold" min="30" max="95" step="1" />
+          <div class="help">Cuts at <code id="cfg-threshold-eff" style="color:var(--cyan);">—</code> tok (context × threshold).</div>
         </div>
       </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Context Depth (recent pairs)</label>
+          <input type="number" id="cfg-depth" min="1" max="64" step="1" />
+          <div class="help">Most-recent message pairs always kept in the model's window.</div>
+        </div>
+        <div class="field"><label>Max Tool-Call Recursion</label><input type="number" id="cfg-max-recursion" min="1" max="64" step="1" /></div>
+      </div>
       <div class="help" style="font-family:var(--mono); font-size:9.5px; color:var(--text-faint); line-height:1.6;">
-        ◢ ROLLING CONTEXT WINDOW · When token usage crosses the threshold, the oldest middle turns
-        "fall off" until usage drops below the limit. The system prompt and the <em>first user
-        message</em> are always preserved (to keep the original task intact); the most recent turns
-        are preserved too. Tool-call / tool-result pairs are removed together so the trace stays
-        coherent. Indicator: <code>CTX</code> meter in the status bar.
+        ◢ ROLLING CONTEXT WINDOW · The full conversation is <em>always</em> kept in this terminal —
+        nothing is ever deleted from the chat. Only the model's view rolls: once usage crosses the
+        cutoff (context × threshold%), the oldest <em>middle</em> turns "flutter off" and peel away as
+        they age. Always preserved: the system prompt, the <em>first two</em> back-and-forth exchanges
+        (anchoring the original task), and the most-recent <code>Context Depth</code> pairs. Widening
+        the context window or threshold re-admits older turns. Tool-call / tool-result rounds stay
+        whole so the trace never orphans a <code>tool_call_id</code>. Indicator: <code>CTX</code> meter.
       </div>
     </div>
 
@@ -1810,6 +1818,7 @@ const DEFAULTS = {
   maxTokens: 2048,
   context: 64200,
   threshold: 70,
+  contextDepth: 6,          // most-recent message pairs always kept in the model's window
   systemPrompt: 'You are a precise, helpful AI agent operating inside the CHATSGI terminal. Use the MCP tools provided when they help; report your work clearly and cite tool results.',
   assistantName: '',        // display-only label for assistant turns; never sent to the model
   detectedPrompt: '',
@@ -2211,7 +2220,7 @@ function renderEmptyCheck() {
   $('empty-check').innerHTML = `
     <div><span class="key">ENDPOINT  </span><span class="val">${escapeHtml(c.endpoint || '—')}</span></div>
     <div><span class="key">MODEL     </span><span class="val">${escapeHtml(c.model || '—')}</span></div>
-    <div><span class="key">CONTEXT   </span><span class="val">${c.context} tok · cmp ${c.threshold}%</span></div>
+    <div><span class="key">CONTEXT   </span><span class="val">${c.context} tok · cut ${c.threshold}% (${effectiveLimit()}) · depth ${c.contextDepth}</span></div>
     <div><span class="key">MCP NODES </span><span class="val">${mcp} · ${state.tools.length} tools</span></div>
     <div><span class="key">PROXY     </span><span class="val">${c.useProxy ? 'BACKEND' : 'DIRECT'}</span></div>
     <div><span class="key">NETWORK   </span><span class="val">${c.networkVisible ? 'LAN VISIBLE' : 'LOCAL ONLY'}</span></div>
@@ -2399,12 +2408,15 @@ function updateStatus() {
   // send), so it plateaus near the threshold as the oldest messages peel off.
   const win = contextWindow();
   const used = win.tokens;
+  const eff = effectiveLimit();
   state.status.contextUsed = used;
   const pct = Math.min(100, (used / Math.max(1, c.context)) * 100);
   $('ctx-fill').style.width = pct + '%';
   $('ctx-marker').style.left = (c.threshold) + '%';
   $('ctx-text').textContent = pct.toFixed(1) + '%';
-  $('foot-ctx').textContent = `${used} / ${c.context}`;
+  // Footer shows the model-side usage against the real cutoff (context ×
+  // threshold%), with the hard context cap noted alongside.
+  $('foot-ctx').textContent = `${used} / ${eff} · max ${c.context}`;
 
   const pillCtx = $('pill-ctx');
   pillCtx.classList.remove('warn','crit');
@@ -2420,7 +2432,7 @@ function updateStatus() {
   $('stat-servers').textContent = `${onl} / ${state.servers.length}`;
   $('foot-mcp').textContent = `${onl}/${state.servers.length}`;
   $('stat-compactions').textContent = win.dropped;
-  $('stat-threshold').textContent = c.threshold + '%';
+  $('stat-threshold').textContent = `${c.threshold}% · ${eff} tok`;
   $('stat-backend').textContent = state.status.backendOk === true ? 'OK' : (state.status.backendOk === false ? 'DOWN' : '—');
   $('stat-network').textContent = c.networkVisible ? 'LAN' : 'LOCAL';
 
@@ -3106,62 +3118,105 @@ function _overheadTokens() {
   return t;
 }
 
-// Number of leading messages that make up the first two back-and-forth
-// exchanges. An exchange completes on an assistant reply that is NOT a tool
-// call, so the anchor never ends in the middle of a tool sequence.
-function _anchorSpan(msgs) {
-  let completed = 0, seenUser = false;
-  for (let i = 0; i < msgs.length; i++) {
-    const m = msgs[i];
-    if (m.role === 'user') seenUser = true;
-    if (m.role === 'assistant' && seenUser && (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0)) {
-      seenUser = false;
-      if (++completed >= 2) return i + 1;
-    }
-  }
-  return msgs.length; // fewer than two complete exchanges → keep everything
+// The token budget the model window is allowed to fill: context × threshold%.
+// This is the "new context limit" surfaced next to the threshold slider — the
+// point at which the oldest middle messages start peeling off.
+function effectiveLimit() {
+  const c = state.settings;
+  return Math.max(1, Math.round((Number(c.context) || 0) * ((Number(c.threshold) || 0) / 100)));
 }
 
-// Drop tool results whose originating tool_call is not in the window so the
-// transcript we send stays coherent (no orphaned tool_call_ids).
+// Live-update the "new context limit" readout beside the threshold slider from
+// the in-progress form values, so editing context or threshold immediately
+// shows where the model's context will actually be cut (context × threshold%).
+function syncThresholdEff() {
+  const el = $('cfg-threshold-eff');
+  if (!el) return;
+  const ctx = parseInt($('cfg-ctx').value) || 0;
+  const thr = parseInt($('cfg-threshold').value) || 0;
+  el.textContent = Math.max(1, Math.round(ctx * (thr / 100)));
+}
+
+// Break the transcript into "turns" (a.k.a. message pairs). Each turn begins at
+// a user message and absorbs every following assistant reply, tool call and
+// tool result up to (but not including) the next user message — so a complete
+// tool-calling round always lives inside a single turn and can never be split
+// across the window boundary. Any leading non-user messages form turn 0.
+function _segmentTurns(msgs) {
+  const turns = [];
+  let cur = null;
+  for (const m of msgs) {
+    if (m.role === 'user') { if (cur) turns.push(cur); cur = [m]; }
+    else { if (!cur) cur = []; cur.push(m); }
+  }
+  if (cur) turns.push(cur);
+  return turns;
+}
+
+// Drop tool results whose originating tool_call is not in the window, and any
+// assistant tool_call whose result is not in the window, so the transcript we
+// send stays coherent (no orphaned tool_call_ids in either direction).
 function _dropOrphanToolResults(kept) {
   const callIds = new Set();
-  for (const m of kept) for (const id of _toolCallIds(m)) callIds.add(id);
-  return kept.filter(m => !(m.role === 'tool' && m.tool_call_id && !callIds.has(m.tool_call_id)));
+  const resultIds = new Set();
+  for (const m of kept) {
+    for (const id of _toolCallIds(m)) callIds.add(id);
+    if (m.role === 'tool' && m.tool_call_id) resultIds.add(m.tool_call_id);
+  }
+  return kept.filter(m => {
+    if (m.role === 'tool' && m.tool_call_id && !callIds.has(m.tool_call_id)) return false;
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const ids = _toolCallIds(m);
+      if (ids.length && !ids.some(id => resultIds.has(id))) return false;
+    }
+    return true;
+  });
 }
-// Compute the subset of the transcript that fits the model budget. The oldest
-// messages beyond the first two exchanges are peeled off first. state.messages
-// is NEVER modified, so this is purely a view onto the model's context.
+
+// Compute the subset of the transcript that fits the model budget. The window
+// always keeps, in full, the first two back-and-forth exchanges (the anchor)
+// and the most-recent `contextDepth` pairs; the oldest MIDDLE turns peel off
+// first, fluttering away as the conversation ages and the budget tightens.
+// state.messages is NEVER modified, so this is purely a view onto the model's
+// context — widening `context`/`threshold` re-admits older turns next call.
 function selectContextMessages() {
   const c = state.settings;
   const msgs = _eligibleMessages();
-  const limit = Math.max(1, c.context * (c.threshold / 100));
+  const limit = effectiveLimit();
   const overhead = _overheadTokens();
 
   let total = overhead;
   for (const m of msgs) total += msgTokens(m);
   if (total <= limit) return msgs;            // whole transcript fits
 
-  const span = _anchorSpan(msgs);
-  if (span >= msgs.length) return msgs;       // cannot crop into the anchor
+  const turns = _segmentTurns(msgs);
+  const anchorCount = Math.min(2, turns.length);                 // first two pairs
+  const depth = Math.max(1, Number(c.contextDepth) || 6);        // recent pairs to keep
+  const recentStart = Math.max(anchorCount, turns.length - depth);
 
-  const anchors = msgs.slice(0, span);
-  const rest = msgs.slice(span);
+  const turnCost = t => t.reduce((s, m) => s + msgTokens(m), 0);
 
+  // Always-kept turns: the anchor and the most-recent `depth` pairs. These are
+  // preserved even if they alone exceed the budget — coherence over budget.
+  const kept = new Set();
   let used = overhead;
-  for (const m of anchors) used += msgTokens(m);
+  for (let i = 0; i < anchorCount; i++) { kept.add(i); used += turnCost(turns[i]); }
+  for (let i = recentStart; i < turns.length; i++) { kept.add(i); used += turnCost(turns[i]); }
 
-  // Admit the most-recent messages until the budget is spent; the oldest
-  // middle messages are the ones that peel off. Always keep the newest one.
-  const tail = [];
-  for (let i = rest.length - 1; i >= 0; i--) {
-    const t = msgTokens(rest[i]);
-    if (tail.length && used + t > limit) break;
-    used += t;
-    tail.unshift(rest[i]);
+  // Admit middle turns newest-first until the budget is spent; the oldest
+  // middle turns are the ones that peel off. Stop at the first that won't fit
+  // so the retained middle stays a contiguous block adjacent to the recent
+  // window (no scattered gaps).
+  for (let i = recentStart - 1; i >= anchorCount; i--) {
+    const cost = turnCost(turns[i]);
+    if (used + cost > limit) break;
+    used += cost;
+    kept.add(i);
   }
 
-  return _dropOrphanToolResults([...anchors, ...tail]);
+  const out = [];
+  for (let i = 0; i < turns.length; i++) if (kept.has(i)) for (const m of turns[i]) out.push(m);
+  return _dropOrphanToolResults(out);
 }
 
 // Snapshot of the current model-side context for the status UI.
@@ -3403,7 +3458,9 @@ async function applyToForm() {
   $('cfg-stop').value = c.stopSequences;
   $('cfg-ctx').value = c.context;
   $('cfg-threshold').value = c.threshold;
+  $('cfg-depth').value = c.contextDepth;
   $('cfg-max-recursion').value = c.maxToolRecursion;
+  syncThresholdEff();
   $('cfg-assistant-name').value = c.assistantName || '';
   $('cfg-sysprompt').value = c.systemPrompt;
   $('cfg-detected').value = c.detectedPrompt || '(not fetched)';
@@ -3440,6 +3497,7 @@ function readForm() {
   c.stopSequences = $('cfg-stop').value;
   c.context = parseInt($('cfg-ctx').value) || DEFAULTS.context;
   c.threshold = parseInt($('cfg-threshold').value) || DEFAULTS.threshold;
+  c.contextDepth = Math.max(1, parseInt($('cfg-depth').value) || DEFAULTS.contextDepth);
   c.maxToolRecursion = parseInt($('cfg-max-recursion').value) || 16;
   c.systemPrompt = $('cfg-sysprompt').value;
   c.assistantName = $('cfg-assistant-name').value.trim().slice(0, 32);
@@ -3565,6 +3623,13 @@ function attachWiring() {
       if (!state.activeChatId) { showToast('NO ACTIVE CHAT', 'Create one first.', 'amber'); return; }
       await chatAction(state.activeChatId, btn.dataset.actAct);
     });
+  });
+
+  // Keep the "new context limit" readout live as the operator edits either the
+  // context size or the roll threshold.
+  ['cfg-ctx', 'cfg-threshold'].forEach(id => {
+    const el = $(id);
+    if (el) el.addEventListener('input', syncThresholdEff);
   });
 
   $('btn-roll-now').addEventListener('click', () => {
