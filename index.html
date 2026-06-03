@@ -1473,7 +1473,7 @@ footer .net-pill.lan { color: var(--magenta); border-color: var(--magenta); }
         <div class="lbl">Tokens</div><div class="val" id="stat-tokens">0</div>
         <div class="lbl">Tools</div><div class="val" id="stat-tools">0</div>
         <div class="lbl">Servers</div><div class="val" id="stat-servers">0 / 0</div>
-        <div class="lbl">Rolls</div><div class="val" id="stat-compactions">0</div>
+        <div class="lbl">Held</div><div class="val" id="stat-compactions">0</div>
         <div class="lbl">Threshold</div><div class="val" id="stat-threshold">70%</div>
         <div class="lbl">Backend</div><div class="val" id="stat-backend">—</div>
         <div class="lbl">Network</div><div class="val" id="stat-network">LOCAL</div>
@@ -2395,7 +2395,10 @@ function renderToolRoster() {
 
 function updateStatus() {
   const c = state.settings;
-  const used = totalTokens();
+  // The gauge tracks the MODEL-side context (the windowed subset we actually
+  // send), so it plateaus near the threshold as the oldest messages peel off.
+  const win = contextWindow();
+  const used = win.tokens;
   state.status.contextUsed = used;
   const pct = Math.min(100, (used / Math.max(1, c.context)) * 100);
   $('ctx-fill').style.width = pct + '%';
@@ -2416,15 +2419,16 @@ function updateStatus() {
   const onl = state.servers.filter(s => s.status === 'online').length;
   $('stat-servers').textContent = `${onl} / ${state.servers.length}`;
   $('foot-mcp').textContent = `${onl}/${state.servers.length}`;
-  $('stat-compactions').textContent = state.status.compactions;
+  $('stat-compactions').textContent = win.dropped;
   $('stat-threshold').textContent = c.threshold + '%';
   $('stat-backend').textContent = state.status.backendOk === true ? 'OK' : (state.status.backendOk === false ? 'DOWN' : '—');
   $('stat-network').textContent = c.networkVisible ? 'LAN' : 'LOCAL';
 
-  // footer context-roll indicator
+  // footer context-roll indicator — shows how many oldest messages are
+  // currently held out of the model's window (chat still shows them all).
   const cmp = $('foot-cmp');
-  cmp.classList.toggle('busy', state.status.compacting);
-  $('foot-cmp-text').textContent = state.status.compacting ? 'ROLLING…' : 'idle';
+  cmp.classList.toggle('busy', win.dropped > 0);
+  $('foot-cmp-text').textContent = win.dropped > 0 ? `WINDOWED · ${win.dropped} held` : 'full context';
 
   // footer network pill
   const netPill = $('foot-net');
@@ -3063,129 +3067,110 @@ async function fetchTemplate() {
   else { out.className = 'test-result err'; out.textContent = '▸ endpoint does not expose a chat template or default system prompt.'; }
 }
 
-/* ───────────────── Rolling context window ─────────────────
-   Replaces the older summarisation-based "compaction". When token usage
-   crosses the configured threshold, drop the OLDEST middle messages until
-   we fall back below the limit. Always preserve:
-     • the first user message (the original task) so continuity is kept
-     • the most-recent N messages (current actions in flight)
-   Tool-call / tool-result pairs are removed together so the trace stays
-   coherent (no orphaned tool_call_ids). The system prompt is set outside
-   the message buffer (in buildOutgoing) and is never affected.
+/* ───────────────── Rolling context window (non-destructive) ─────────────────
+   The full conversation is ALWAYS kept in state.messages — it is never
+   truncated — so the chat interface keeps showing every message and nothing
+   is ever lost. What changes is only what we hand to the model: when the
+   transcript would exceed the configured budget (context × threshold%), we
+   compute a *window* that always keeps
+     • the system prompt (added separately in buildOutgoing), and
+     • the first two complete back-and-forth exchanges (the first two user
+       turns and the first two assistant replies — the anchoring context),
+   then admits the most-recent messages that still fit. The OLDEST messages
+   beyond those first two exchanges peel off the model's view first and
+   "flutter" away as the conversation ages.
+
+   Because the window is recomputed from the untouched transcript on every
+   turn, it is fully reversible: widening the context window (or raising the
+   threshold) simply re-admits older messages on the next call.
+
+   Tool-call / tool-result pairs stay coherent: the anchor always ends on a
+   completed assistant reply, and any tool result whose originating tool_call
+   fell outside the window is dropped so no orphaned tool_call_ids are sent.
 */
 function _toolCallIds(m) {
   if (!Array.isArray(m.tool_calls)) return [];
   return m.tool_calls.map(tc => tc.id).filter(Boolean);
 }
-function rollContext({ force = false } = {}) {
+
+// Messages that form the LLM transcript (everything except UI-only markers).
+function _eligibleMessages() {
+  return state.messages.filter(m => !m._rolled && !m._compaction);
+}
+
+// Fixed token cost that is always present alongside the messages.
+function _overheadTokens() {
   const c = state.settings;
+  let t = estTok(c.systemPrompt) + 8;
+  if (c.toolsEnabled && state.tools.length) t += estTok(JSON.stringify(state.tools));
+  return t;
+}
+
+// Number of leading messages that make up the first two back-and-forth
+// exchanges. An exchange completes on an assistant reply that is NOT a tool
+// call, so the anchor never ends in the middle of a tool sequence.
+function _anchorSpan(msgs) {
+  let completed = 0, seenUser = false;
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.role === 'user') seenUser = true;
+    if (m.role === 'assistant' && seenUser && (!Array.isArray(m.tool_calls) || m.tool_calls.length === 0)) {
+      seenUser = false;
+      if (++completed >= 2) return i + 1;
+    }
+  }
+  return msgs.length; // fewer than two complete exchanges → keep everything
+}
+
+// Drop tool results whose originating tool_call is not in the window so the
+// transcript we send stays coherent (no orphaned tool_call_ids).
+function _dropOrphanToolResults(kept) {
+  const callIds = new Set();
+  for (const m of kept) for (const id of _toolCallIds(m)) callIds.add(id);
+  return kept.filter(m => !(m.role === 'tool' && m.tool_call_id && !callIds.has(m.tool_call_id)));
+}
+// Compute the subset of the transcript that fits the model budget. The oldest
+// messages beyond the first two exchanges are peeled off first. state.messages
+// is NEVER modified, so this is purely a view onto the model's context.
+function selectContextMessages() {
+  const c = state.settings;
+  const msgs = _eligibleMessages();
   const limit = Math.max(1, c.context * (c.threshold / 100));
-  const msgs = state.messages;
-  if (msgs.length < 4) return false;
-  if (!force && totalTokens() < limit) return false;
-  if (state.status.compacting) return false;
+  const overhead = _overheadTokens();
 
-  state.status.compacting = true; updateStatus();
+  let total = overhead;
+  for (const m of msgs) total += msgTokens(m);
+  if (total <= limit) return msgs;            // whole transcript fits
 
-  // identify anchors:
-  //   - the FIRST user message (to keep the original task intact)
-  //   - the last KEEP_TAIL messages (current actions)
-  const KEEP_TAIL = Math.max(4, Math.min(12, Math.floor(msgs.length * 0.25)));
-  let firstUserIdx = msgs.findIndex(m => m.role === 'user');
-  if (firstUserIdx < 0) firstUserIdx = 0;
+  const span = _anchorSpan(msgs);
+  if (span >= msgs.length) return msgs;       // cannot crop into the anchor
 
-  const tailStart = Math.max(firstUserIdx + 1, msgs.length - KEEP_TAIL);
-  // collect indices we are allowed to drop, OLDEST FIRST
-  const droppable = [];
-  for (let i = firstUserIdx + 1; i < tailStart; i++) droppable.push(i);
+  const anchors = msgs.slice(0, span);
+  const rest = msgs.slice(span);
 
-  // group tool_call → tool_result pairs together so they drop atomically
-  const groups = [];
-  let i = 0;
-  while (i < droppable.length) {
-    const idx = droppable[i];
-    const m = msgs[idx];
-    const ids = _toolCallIds(m);
-    if (ids.length) {
-      const grp = [idx];
-      // follow up: consume immediately-following tool results matching these ids
-      let j = i + 1;
-      while (j < droppable.length) {
-        const next = msgs[droppable[j]];
-        if (next.role === 'tool' && (!next.tool_call_id || ids.includes(next.tool_call_id))) {
-          grp.push(droppable[j]); j++;
-        } else break;
-      }
-      groups.push(grp);
-      i = j;
-    } else {
-      groups.push([idx]);
-      i++;
-    }
+  let used = overhead;
+  for (const m of anchors) used += msgTokens(m);
+
+  // Admit the most-recent messages until the budget is spent; the oldest
+  // middle messages are the ones that peel off. Always keep the newest one.
+  const tail = [];
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const t = msgTokens(rest[i]);
+    if (tail.length && used + t > limit) break;
+    used += t;
+    tail.unshift(rest[i]);
   }
 
-  const drop = new Set();
-  let dropped = 0;
-  for (const grp of groups) {
-    if (totalTokens() < limit && !force) break;
-    grp.forEach(k => drop.add(k));
-    // also drop any orphan tool results elsewhere referencing our ids
-    const ids = new Set();
-    for (const k of grp) for (const id of _toolCallIds(msgs[k])) ids.add(id);
-    if (ids.size) {
-      for (let k = 0; k < msgs.length; k++) {
-        if (drop.has(k)) continue;
-        const mm = msgs[k];
-        if (mm.role === 'tool' && mm.tool_call_id && ids.has(mm.tool_call_id)) drop.add(k);
-      }
-    }
-    dropped += grp.length;
-    // quick re-estimate
-    const trimmed = msgs.filter((_, k) => !drop.has(k));
-    const prev = state.messages;
-    state.messages = trimmed;
-    const newUsed = totalTokens();
-    state.messages = prev; // restore until commit
-    if (newUsed < limit && !force) break;
-  }
+  return _dropOrphanToolResults([...anchors, ...tail]);
+}
 
-  if (!drop.size) {
-    state.status.compacting = false; updateStatus();
-    return false;
-  }
-
-  // Final coherence pass: if any kept `tool` message references a tool_call_id
-  // that was dropped, drop it too (avoid orphan tool results).
-  const keptCallIds = new Set();
-  msgs.forEach((mm, k) => {
-    if (drop.has(k)) return;
-    for (const id of _toolCallIds(mm)) keptCallIds.add(id);
-  });
-  msgs.forEach((mm, k) => {
-    if (drop.has(k)) return;
-    if (mm.role === 'tool' && mm.tool_call_id && !keptCallIds.has(mm.tool_call_id)) {
-      drop.add(k);
-    }
-  });
-
-  const kept = msgs.filter((_, k) => !drop.has(k));
-  // leave a small marker so users see something happened (rendered compactly)
-  const marker = {
-    role: 'system',
-    _ts: Date.now(),
-    _rolled: true,
-    _droppedCount: dropped,
-    content: `◢ CONTEXT ROLL · ${dropped} older message(s) fell out of the window`,
-  };
-  // insert the marker just after the first user message (or at start)
-  const insertAt = firstUserIdx + 1;
-  state.messages = [...kept.slice(0, insertAt), marker, ...kept.slice(insertAt)];
-
-  state.status.compactions++;
-  state.status.compacting = false;
-  queuePersist();
-  renderMessages(); updateStatus();
-  return true;
+// Snapshot of the current model-side context for the status UI.
+function contextWindow() {
+  const sel = selectContextMessages();
+  let tokens = _overheadTokens();
+  for (const m of sel) tokens += msgTokens(m);
+  const eligible = _eligibleMessages().length;
+  return { messages: sel, tokens, dropped: Math.max(0, eligible - sel.length) };
 }
 
 /* ───────────────── Chat ───────────────── */
@@ -3193,9 +3178,9 @@ function buildOutgoing() {
   const c = state.settings;
   const messages = [];
   if (c.systemPrompt && c.systemPrompt.trim()) messages.push({ role: 'system', content: c.systemPrompt });
-  for (const m of state.messages) {
-    // Skip UI-only "roll" markers — they are decoration, not part of the LLM transcript.
-    if (m._rolled || m._compaction) continue;
+  // Only the windowed subset goes to the model; the full transcript stays in
+  // state.messages so the chat interface still shows everything.
+  for (const m of selectContextMessages()) {
     const o = { role: m.role };
     if (m.content !== undefined) o.content = m.content;
     if (m.tool_calls) o.tool_calls = m.tool_calls;
@@ -3256,11 +3241,11 @@ async function runTurn(depth = 0) {
     queuePersist();
     renderMessages(); return;
   }
-  // Roll older context off the front before every model call so we stay under
-  // the configured threshold. This also means each recursive tool round gets
-  // a fresh `max_tokens` budget (set by buildOutgoing), so tool calls are NOT
-  // counted against the output-token cap — only `maxToolRecursion` caps depth.
-  rollContext();
+  // The model-side context window is computed inside buildOutgoing() — the
+  // full transcript stays in state.messages, and only what we SEND is bounded.
+  // Each recursive tool round therefore gets a fresh `max_tokens` budget, so
+  // tool calls are NOT counted against the output cap — only `maxToolRecursion`
+  // caps depth.
   const body = buildOutgoing();
   const ai = { role: 'assistant', content: '', reasoning: '', tool_calls: [], _ts: Date.now(), _streaming: true };
   state.messages.push(ai); renderMessages();
@@ -3583,11 +3568,15 @@ function attachWiring() {
   });
 
   $('btn-roll-now').addEventListener('click', () => {
-    if (state.messages.length < 4) { showToast('SKIPPED', 'Not enough turns.', 'amber'); return; }
-    const did = rollContext({ force: true });
-    showToast(did ? 'CONTEXT ROLLED' : 'NOTHING TO ROLL',
-              did ? `${state.status.compactions} total` : 'window already small enough',
-              did ? 'cyan' : 'amber');
+    // Cropping is now automatic and non-destructive; this just reports the
+    // current model-side window without altering the stored conversation.
+    const w = contextWindow();
+    showToast(w.dropped ? 'CONTEXT WINDOWED' : 'FULL CONTEXT',
+              w.dropped
+                ? `${w.dropped} oldest message(s) held out of the model window`
+                : 'entire conversation fits the model window',
+              w.dropped ? 'cyan' : 'amber');
+    updateStatus();
   });
   $('btn-restart-mcp').addEventListener('click', async () => {
     try { await apiPost('/api/servers/reload', {}); showToast('MCP', 'Servers restarting.', 'amber'); setTimeout(refreshServers, 1500); setTimeout(refreshServers, 4000); }
